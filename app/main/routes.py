@@ -3,11 +3,12 @@
 from flask import Blueprint, render_template, request, flash, redirect, url_for, jsonify, current_app
 from flask_login import login_required, current_user
 from sqlalchemy import desc, func
+from datetime import datetime
 
 from app.extensions import db
 from app.models.user import User
 from app.models.course import Course, Lesson
-from app.models.quiz import Quiz, QuizAttempt
+from app.models.quiz import Quiz, QuizAttempt, Question
 from app.models.enrollment import Enrollment
 
 bp = Blueprint('main', __name__)
@@ -205,3 +206,218 @@ def courses():
                            current_user = search)
 
     
+@bp.route('/course/<int:course_id>')
+def course_details(course_id):
+    # Course detials page 
+    course = Course.query.get_or_404(course_id)
+
+    if not course.is_published and not (current_user.is_authenticated and (
+        current_user.is_admin() or current_user.id == course.instructor_id
+    )):
+        flash('This course is not yet published.', 'error')
+        return redirect(url_for('main.courses'))
+    
+    # Check if the user accesing it is enrolled
+    enrollment = None
+    if current_user.is_authenticated: 
+        enrollment = Enrollment.query.filter_by(
+            user_id = current_user.id,
+            course_id = course_id,
+            is_active = True
+        ).first()
+
+    # Get course lessons (preview for non-enrolled, all for enrolled)
+    if enrollment or (current_user.is_authenticated and 
+                      (current_user.is_admin() or current_user.id ==
+                       course.instructor_id)):
+        lessons = course.lessons.filter_by(is_published = True).order_by(Lesson.order_index).all()
+    else:
+        lessons = course.lessons.filter_by(is_published = True,
+                                           is_preview = True).order_by(Lesson.order_index).all()
+        
+    
+    # Get course stats
+    enrollment_count = course.get_enrollment_count()
+    average_rating = course.get_average_rating()
+
+    return render_template('main/course_detail.html',
+                           course = course,
+                           lessons = lessons,
+                           enrollment = enrollment,
+                           enrollment_count = enrollment_count,
+                           average_rating = average_rating) 
+
+
+@bp.route('/course/<int:course_id>/enroll', methods = ['POST'])
+@login_required
+def enroll_course(course_id):
+    #Enroll in a course
+    course = Course.query.get_or_404(course_id)
+
+    if not course.is_published:
+        if request.is_json:
+            return jsonify({'success': False, 'message': 'Course is not '
+            'available for enrollment.'}), 400
+        flash('Course is not available for enrollment.', 'error')
+        return redirect(url_for('main.course_detial', course_id = course_id))
+    
+
+    # Check if already enrolled 
+    existing_enrollment = Enrollment.query.filter_by(
+        user_id = current_user.id,
+        course_id = course_id
+    ).first()
+
+    if existing_enrollment:
+        if existing_enrollment.is_active:
+            message = 'You are already enrolled in this course.'
+        else:
+            # reactivate enrollment 
+            existing_enrollment.is_active = True
+            existing_enrollment.status = 'active'
+            existing_enrollment.enrolled_at = datetime.utcnow()
+            db.session.commit()
+            message = "Successfully re-enrolled in the course"
+    else:
+        enrollment = Enrollment(
+            user_id = current_user.id,
+            course_id = course_id
+        )
+
+        db.session.add(enrollment)
+        db.session.commit()
+        message = 'Successfully enrolled in the course!'
+    
+    if request.is_json:
+        return jsonify({
+            'success': True, 
+            'message': message
+        })
+    
+    flash(message, 'success')
+    return redirect(url_for('main.course_detial', course_id= course_id))
+
+
+@bp.route('/lesson/<int:lesson_id>')
+@login_required
+def lesson_detail(lesson_id):
+    # Get the lesson details
+    lesson = Lesson.query.get_or_404(lesson_id)
+    course = lesson.course 
+
+    # Check access permissions
+    if not course.can_be_accessed_by_user(current_user) and not lesson.is_preview:
+        flash('You must be enrolled in this course to access this lesson.')
+        return redirect(url_for('main.course_detial', course_id = course.id))
+    
+    # Get all lessons for navigation
+    all_lessons = course.lessons.filter_by(is_published = True).order_by(
+        Lesson.order_index).all()
+    
+    # Find the current lesson index for navigation
+    current_index = next((i for i, l in enumerate(all_lessons)
+                          if l.id == lesson_id), 0)
+    
+    # Get previous and next lessons 
+    prev_lesson = all_lessons[current_index - 1] if current_index > 0 else None
+    next_lesson = all_lessons[current_index + 1] if current_index < len(all_lessons) - 1 else None
+
+    # Update last accessed time for enrollment
+    if current_user.is_authenticated:
+        enrollment = Enrollment.query.filter_by(
+            user_id = current_user.id,
+            course_id = course.id,
+            is_active = True
+        ).first()
+        if enrollment:
+            enrollment.last_accessed_at = datetime.utcnow()
+            db.session.commit()
+
+    return render_template('main/lesson_detail.html',
+                           lesson = lesson,
+                           course = course,
+                           all_lessons = all_lessons,
+                           current_index = current_index,
+                           prev_lesson = prev_lesson,
+                           next_lesson = next_lesson)
+
+
+@bp.route('/quiz/<int:quiz_id>')
+@login_required
+def quiz_detail(quiz_id):
+    # Get the details of the quiz
+    quiz = Quiz.query.get_or_404()
+    course = quiz.course 
+
+    # Check access permissions
+    if not course.can_be_accessed_by_user(current_user):
+        flash('You must be enrolled in this course to access this quiz.')
+        return redirect(url_for('main.course_detail', course_id = course.id))
+    
+    # Get user's previous attempts
+    user_attempts = QuizAttempt.query.filter_by(
+        user_id = current_user.id,
+        quiz_id = quiz_id
+    ).order_by(desc(QuizAttempt.started_at)).all()
+
+    # Check if the user can attempt the quiz
+    can_attempt = quiz.can_user_attempt(current_user)
+    best_score = quiz.get_user_best_score(current_user)
+
+
+    return render_template('main/quiz_detail.html',
+                           quiz = quiz,
+                           course = course,
+                           user_attempts = user_attempts,
+                           can_attempt = can_attempt,
+                           best_score = best_score)
+
+
+@bp.route('/quiz/<int:quiz_id>/take')
+@login_required
+def take_quiz(quiz_id):
+    # Take quiz page 
+    quiz = Quiz.query.get_or_404(quiz_id)
+    course = quiz.course 
+
+    # Check access permissions
+    if not course.can_be_accessed_by_user(current_user):
+        flash('You must be enrolled in this course to access this quiz.')
+        return redirect(url_for('main.course_detail', course_id = course.id))
+    
+    # Check if the user can attempt the quiz
+    if not quiz.can_user_attempt(current_user):
+        flash('You have reached the maximum number of attempts for this quiz.')
+        return redirect(url_for('main.quiz_detail', quiz_id = quiz_id))
+    
+
+    # create a new quiz attempt 
+    attempt = QuizAttempt(
+        user_id = current_user.id,
+        quiz_id = quiz_id
+    )
+    db.session.add(attempt)
+    db.session.commit()
+
+    # Get quiz questions 
+    questions = quiz.questions.order_by(Question.order_index).all()
+    if quiz.is_ramdomized:
+        import random
+        questions = random.sample(questions, len(questions))
+
+    return render_template('main/take_quiz.html',
+                           quiz = quiz,
+                           questions = questions,
+                           attempt = attempt)
+
+
+# Error handlers
+@bp.app_errorhandler(404)
+def page_not_found(error):
+    return render_template('errors/404.html'), 404
+
+
+@bp.app_errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    return render_template('errors/500.html'), 500

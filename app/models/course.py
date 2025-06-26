@@ -102,12 +102,12 @@ class Lesson(db.Model):
     duration_minutes = db.Column(db.Integer)
     video_url = db.Column(db.String(300))
     materials_url = db.Column(db.String(300))
-    is_published = db.Column(db.Boolean, defaut = True)
-    is_preview = db.Column(db.Boolean, defaut = False)
+    is_published = db.Column(db.Boolean, default = True)
+    is_preview = db.Column(db.Boolean, default = False)
 
     # Timestamps
-    created_at = db.Column(db.DateTime, defaut = datetime.utcnow)
-    updated_at = db.Column(db.DateTime, defaut = datetime.utcnow, onupdate = datetime.utcnow)
+    created_at = db.Column(db.DateTime, default = datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default = datetime.utcnow, onupdate = datetime.utcnow)
 
     def __repr__(self):
         return f'<Lesson {self.title}'
